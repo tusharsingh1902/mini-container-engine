@@ -344,14 +344,84 @@ exec() {
     nsenter -t $CONTAINER_INIT_PID --uts --pid --net --mount --ipc --root --wd $EXEC_CMD_ARGS 
 }
 
-# Functions Pending Implementation
-
 addnetwork() {
-    echo "Function 'addnetwork' is pending implementation."
+    local NAME=${1:-}
+    [ -z "$NAME" ] && fatal_error "Container name is required"
+    
+    local NETNSDIR="/var/run/netns"
+
+    if [ ! -e "$NETNSDIR" ]; then
+        mkdir -p "$NETNSDIR"
+    fi
+
+    local PID=$(ps -ef | grep "$CONTAINERDIR/$NAME/rootfs" | grep -v grep | awk '{print $2}')
+    [ -z "$PID" ] && fatal_error "Cannot find running container process"
+
+    local CONDUCTORNS="/proc/$PID/ns/net"
+    local NSDIR="$NETNSDIR/$NAME"
+
+    if [ -e "$CONDUCTORNS" ]; then
+        rm -f "$NSDIR" 2>/dev/null || true
+    fi
+    ln -sf "$CONDUCTORNS" "$NSDIR"
+
+    local NUM=$(fetch_next_id "$NAME") 
+
+    [ -z "$IP4_PREFIX" ] && IP4_PREFIX="${IP4_SUBNET}.$((0x$NUM))." 
+
+    INSIDE_IP4="${IP4_PREFIX}2"
+    OUTSIDE_IP4="${IP4_PREFIX}1"
+    INSIDE_PEER="${NAME}-inside"
+    OUTSIDE_PEER="${NAME}-outside"
+
+    ip link add $OUTSIDE_PEER type veth peer name $INSIDE_PEER
+    ip link set $INSIDE_PEER netns $NSDIR
+
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+
+    ip -n "$NAME" link set $INSIDE_PEER up
+    ip -n "$NAME" link set lo up
+    ip link set $OUTSIDE_PEER up
+
+    ip addr add dev "$OUTSIDE_PEER" "${OUTSIDE_IP4}/${IP4_PREFIX_SIZE}"
+    ip -n "$NAME" addr add dev "$INSIDE_PEER" "${INSIDE_IP4}/${IP4_PREFIX_SIZE}"
+    ip -n "$NAME" route add "${IP4_SUBNET}/${IP4_FULL_PREFIX_SIZE}" via "$OUTSIDE_IP4" dev "$INSIDE_PEER"
+
+    echo -n "Configuring network for '$NAME' with internal IP ${INSIDE_IP4}..."
+    wait_for_interface "$OUTSIDE_PEER" && wait_for_interface "$INSIDE_PEER" "$NAME"
+    echo " Done."
+
+    if [ "$INTERNET" -eq "1" ]; then
+        ip -n "$NAME" route add default via "$OUTSIDE_IP4" dev "$INSIDE_PEER"
+        
+        iptables -t nat -A POSTROUTING -s "${INSIDE_IP4}/${IP4_PREFIX_SIZE}" -o ${DEFAULT_IFC} -j MASQUERADE
+        iptables -A FORWARD -i ${DEFAULT_IFC} -o ${OUTSIDE_PEER} -j ACCEPT
+        iptables -A FORWARD -i ${OUTSIDE_PEER} -o ${DEFAULT_IFC} -j ACCEPT
+
+        cp /etc/resolv.conf /etc/resolv.conf.old 2>/dev/null || true
+        echo "nameserver 8.8.8.8" > /etc/resolv.conf
+        echo -e "\e[1;36mInternet routing configured.\e[0m"
+    fi
+    
+    if [ "$EXPOSE" -eq "1" ]; then
+        iptables -t nat -A PREROUTING -p tcp -i ${DEFAULT_IFC} --dport ${OUTER_PORT} -j DNAT --to-destination ${INSIDE_IP4}:${INNER_PORT}
+        iptables -t nat -A OUTPUT -o lo -m addrtype --src-type LOCAL --dst-type LOCAL -p tcp --dport ${OUTER_PORT} -j DNAT --to-destination ${INSIDE_IP4}:${INNER_PORT}
+        iptables -A FORWARD -p tcp -d ${INSIDE_IP4} --dport ${INNER_PORT} -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
+        echo -e "\e[1;36mPort mapping established: Host ${OUTER_PORT} -> Container ${INNER_PORT}\e[0m"
+    fi
+
+    rm -rf "$NETNSDIR"
 }
 
 peer() {
-    echo "Function 'peer' is pending implementation."
+    local NAMEA=${1:-}
+    local NAMEB=${2:-}
+    [ -z "$NAMEA" ] && fatal_error "First container name is required"
+    [ -z "$NAMEB" ] && fatal_error "Second container name is required"
+
+    iptables -A FORWARD -i "${NAMEA}-outside" -o "${NAMEB}-outside" -j ACCEPT
+    iptables -A FORWARD -i "${NAMEB}-outside" -o "${NAMEA}-outside" -j ACCEPT
+    echo -e "\e[1;32mPeer-to-peer traffic enabled between $NAMEA and $NAMEB\e[0m"
 }
 
 print_usage() {
