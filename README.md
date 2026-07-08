@@ -1,89 +1,142 @@
-# mini-container-engine
-# Containers From Scratch
+# Conductor — A Minimal Container Runtime in Bash
 
-## Overview
+A lightweight container engine written entirely in Bash, built on raw Linux kernel primitives — no Docker, no containerd, no external runtime dependencies. It builds images, launches isolated processes, wires up networking, and manages filesystems using nothing but `unshare`, `nsenter`, `overlayfs`, and standard networking tools.
 
-This task implements a Docker-like container management tool using Bash and core Linux primitives. The tool, called **Conductor**, enables you to build images, instantiate containers, manage networking, and layer filesystems using overlayfs—all from scratch, without relying on Docker or other container engines.
+## What's in here
 
+Two files do all the work:
 
----
+| File | Role |
+|---|---|
+| `conductor.sh` | Main driver script — every container/image command goes through this |
+| `setup.sh` | Local config: network interface name, storage paths, etc. |
 
-## Features
+## Setup
 
-- **Image Building:** Create Debian/Ubuntu-based images using a Dockerfile-like Conductorfile. Supports `FROM`, `COPY`, and `RUN` instructions with layered overlayfs.
-- **Container Lifecycle:** Instantiate, list, stop, and remove containers. Each container is isolated using Linux namespaces (PID, UTS, NET, MOUNT, IPC).
-
----
-
-## Prerequisites
-
-- **Operating System:** Linux (recommended inside provided VM)
-- **Tools:** `ip`, `ping`, `iptables`, `top`, `debootstrap`, `sha256sum`
-- **Install dependencies:**
+You'll need a Linux box (a VM is fine) with these installed:
 
 ```bash
 sudo apt install debootstrap iptables
 ```
 
+Also make sure `ip`, `ping`, `top`, and `sha256sum` are available (they usually are by default on any Debian/Ubuntu system).
 
----
+Before running anything, open `setup.sh` and set `DEFAULT_IFC` to whatever your machine's outward-facing network interface is called. Run `ip a` if you're not sure which one that is.
 
-## Usage
+## What it can do
 
-### 1. Build an Image
+- **Build images** from a `Conductorfile` (yes, it's basically a Dockerfile clone) — supports `FROM`, `COPY`, and `RUN`, layered together with `overlayfs`
+- **Spin up containers** with real process isolation via Linux namespaces — PID, mount, network, UTS, and IPC are all separated per-container
+- **Attach networking** — each container gets its own `veth` pair, can be NATed out to the internet, or have host ports forwarded straight into it
+- **Exec into running containers** by hooking into their existing namespaces with `nsenter`
+- **Link containers together** so two running containers can talk to each other directly
+- Handles the boring-but-necessary stuff automatically: mounting `/dev`, `proc`, and `sysfs` inside every container so it actually behaves like a normal Linux environment
 
-Prepare a `Conductorfile` (like a Dockerfile) with instructions:
+## Command reference
 
+**Build an image**
+
+Write a `Conductorfile`:
 ```
 FROM debian:bookworm
 COPY ./myapp /opt/myapp
 RUN apt update && apt install -y python3
 ```
 
-Build the image:
-
+Then build it:
 ```bash
 sudo ./conductor.sh build myimage Conductorfile
 ```
 
-### 2. List Images
-
+**List images**
 ```bash
 sudo ./conductor.sh images
 ```
 
-### 3. Run a Container
-
+**Run a container**
 ```bash
-sudo ./conductor.sh run myimage mycontainer -- [command args]
-# If no command is given, defaults to /bin/bash
+sudo ./conductor.sh run myimage mycontainer -- [cmd args]
 ```
+No command given? Defaults to dropping you into `/bin/bash`.
 
-### 4. List Running Containers
-
+**List running containers**
 ```bash
 sudo ./conductor.sh ps
 ```
 
-### 5. Execute a Command in a Running Container
-
+**Exec into a running container**
 ```bash
-sudo ./conductor.sh exec mycontainer -- [command args]
-# Example: sudo ./conductor.sh exec mycontainer -- /bin/bash
+sudo ./conductor.sh exec mycontainer -- /bin/bash
 ```
 
-### 6. Stop and Remove a Container
-
+**Stop a container**
 ```bash
 sudo ./conductor.sh stop mycontainer
 ```
 
-### 7. Remove an Image
-
+**Remove an image**
 ```bash
 sudo ./conductor.sh rmi myimage
 ```
 
+**Clear cached layers**
+```bash
+sudo ./conductor.sh rmcache
+```
 
+**Networking**
 
----
+Give a container basic networking:
+```bash
+sudo ./conductor.sh addnetwork mycontainer
+```
+
+Give it internet access too:
+```bash
+sudo ./conductor.sh addnetwork mycontainer -i
+```
+
+Forward a host port into the container (host 80 → container 8080 here):
+```bash
+sudo ./conductor.sh addnetwork mycontainer -e 8080-80
+```
+
+Connect two containers directly:
+```bash
+sudo ./conductor.sh peer container1 container2
+```
+
+## How it's actually built under the hood
+
+| Piece | Mechanism |
+|---|---|
+| Image builds | `debootstrap` pulls the base rootfs, the `Conductorfile` gets parsed line by line, each layer stacked via `overlayfs` |
+| Running a container | `unshare` creates the new namespaces, `chroot` jumps into the overlay root, then `/dev`, `proc`, `sysfs` get mounted in |
+| Exec into a container | `nsenter` joins all of the target container's active namespaces |
+| Networking | `veth` pairs created via `ip`, NAT and port-forwarding handled through `iptables` |
+| Storage | `overlayfs` gives copy-on-write layering so images and containers don't duplicate data unnecessarily |
+
+## End-to-end example
+
+```bash
+# build an image
+sudo ./conductor.sh build testimage Conductorfile
+
+# launch a container from it
+sudo ./conductor.sh run testimage eg
+
+# give it internet + forward host:3000 to container:8080
+sudo ./conductor.sh addnetwork eg -i -e 3000-8080
+
+# get a shell inside it
+sudo ./conductor.sh exec eg -- /bin/bash
+
+# tear it down
+sudo ./conductor.sh stop eg
+```
+
+## References
+
+- [OverlayFS — Arch Wiki](https://wiki.archlinux.org/title/Overlay_filesystem)
+- [Debootstrap — Debian Wiki](https://wiki.debian.org/Debootstrap)
+- [Linux Namespaces — LWN.net](https://lwn.net/Articles/531381/)
